@@ -17,7 +17,23 @@ import implicit.cuda
 from .recommender_base import MatrixFactorizationBase
 
 
-ctypedef fused integral:
+ctypedef fused integral_1:
+    signed char
+    short
+    int
+    long
+    long long
+
+
+ctypedef fused integral_2:
+    signed char
+    short
+    int
+    long
+    long long
+
+
+ctypedef fused integral_3:
     signed char
     short
     int
@@ -53,8 +69,8 @@ cdef extern from "bpr.h" namespace "implicit" nogil:
 
 
 @cython.boundscheck(False)
-cdef long long lower_bound(integral[::1] sorted_list, integral value) nogil:
-    cdef integral index = \
+cdef long long lower_bound(numeric[::1] sorted_list, numeric value) nogil:
+    cdef ptrdiff_t index = \
         algorithm.lower_bound(&sorted_list[0], &sorted_list[sorted_list.shape[0]], value) \
         - &sorted_list[0]
     if index >= sorted_list.shape[0]:
@@ -63,7 +79,7 @@ cdef long long lower_bound(integral[::1] sorted_list, integral value) nogil:
 
 
 @cython.boundscheck(False)
-cdef int find_row_number(integral[::1] indptr, integral cell_index) nogil:
+cdef int find_row_number(integral_1[::1] indptr, integral_2 cell_index) nogil:
     cdef long long row_number = lower_bound(indptr, cell_index)
     if row_number >= indptr.shape[0] - 1:
         row_number = -1
@@ -71,8 +87,8 @@ cdef int find_row_number(integral[::1] indptr, integral cell_index) nogil:
 
 
 @cython.boundscheck(False)
-cdef long long find_entry_index(integral[::1] indices, integral[::1] indptr,
-                                integral row, integral col) nogil:
+cdef long long find_entry_index(integral_1[::1] indices, integral_2[::1] indptr,
+                                integral_3 row, integral_3 col) nogil:
     cdef long long index_in_row = lower_bound(indices[indptr[row] : indptr[row + 1]], col)
     if index_in_row == -1:
         return -1
@@ -80,8 +96,8 @@ cdef long long find_entry_index(integral[::1] indices, integral[::1] indptr,
 
 
 @cython.boundscheck(False)
-cdef bool is_liked(integral[::1] indices, integral[::1] indptr, numeric[:] ratings,
-                   integral row, integral col) nogil:
+cdef bool is_liked(integral_1[::1] indices, integral_2[::1] indptr, numeric[:] ratings,
+                   integral_3 row, integral_3 col) nogil:
     """ Given a CSR matrix, returns whether the [rowid, colid] contains a non zero.
     Assumes the CSR matrix has sorted indices """
     cdef long long index = find_entry_index(indices, indptr, row, col)
@@ -233,7 +249,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         with tqdm(total=self.iterations, disable=not show_progress) as progress:
             for epoch in range(self.iterations):
                 correct, skipped = bpr_update(rng, user_items.data, user_items.indices, user_items.indptr,
-                                              self.user_factors, self.item_factors, self.non_bias_factors,
+                                              self.user_factors, self.item_factors,
                                               self.learning_rate, self.regularization,
                                               self.implicit, self.weighted_negatives, self.item_biases,
                                               num_threads, self.verify_negative_samples)
@@ -293,7 +309,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
 @cython.cdivision(True)
 @cython.boundscheck(False)
 cdef floating _predict_score(floating[:, :] X, floating[:, :] Y,
-                             integral user_index, integral item_index, floating mean_rating) nogil:
+                             integral_1 user_index, integral_1 item_index, floating mean_rating) nogil:
     if user_index == -1 or item_index == -1:
         return mean_rating
     cdef floating * user = &X[user_index, 0]
@@ -307,10 +323,11 @@ cdef floating _predict_score(floating[:, :] X, floating[:, :] Y,
 
 @cython.cdivision(True)
 @cython.boundscheck(False)
-def csr_predict(integral[:] itemids, integral[:] indptr,
+def csr_predict(integral_1[:] itemids, integral_2[:] indptr,
                 floating[:, :] X, floating[:, :] Y,
                 floating mean_rating, floating[:] out, int num_threads):
-    cdef integral interaction_index, user_index, item_index
+    cdef integral_1 user_index, item_index
+    cdef integral_2 interaction_index
     with nogil, parallel(num_threads=num_threads):
         for user_index in prange(len(indptr) - 1, schedule='guided'):
             for interaction_index in range(indptr[user_index], indptr[user_index + 1]):
@@ -320,10 +337,11 @@ def csr_predict(integral[:] itemids, integral[:] indptr,
 
 @cython.cdivision(True)
 @cython.boundscheck(False)
-def index_pairs_predict(integral[:, :] index_pairs,
+def index_pairs_predict(integral_1[:, :] index_pairs,
                         floating[:, :] X, floating[:, :] Y,
                         floating mean_rating, floating[:] out, int num_threads):
-    cdef integral interaction_index, user_index, item_index
+    cdef integral_1 user_index, item_index
+    cdef long long interaction_index
     with nogil, parallel(num_threads=num_threads):
         for interaction_index in prange(index_pairs.shape[0], schedule='guided'):
             user_index = index_pairs[interaction_index, 0]
@@ -334,24 +352,23 @@ def index_pairs_predict(integral[:, :] index_pairs,
 @cython.cdivision(True)
 @cython.boundscheck(False)
 def bpr_update(RNGVector rng,
-               numeric[:] ratings, integral[::1] itemids, integral[::1] indptr,
+               numeric[:] ratings, integral_1[::1] itemids, integral_2[::1] indptr,
                floating[:, :] X, floating[:, :] Y,
                float learning_rate, float reg,
                bool implicit, bool weighted_negatives, bool item_biases,
                int num_threads, bool verify_neg):
-    cdef integral users = X.shape[0], items = Y.shape[0]
-    cdef long samples = len(itemids), i, liked_index, disliked_index, correct = 0, skipped = 0
-    cdef integral j, liked_id, disliked_id, thread_id
-    cdef long long user_id
-    cdef integral user_interaction_count, interaction_number
+    cdef int users = X.shape[0], items = Y.shape[0]
+    cdef long long samples = len(itemids), i, liked_index, disliked_index, correct = 0, skipped = 0
+    cdef int j, user_id, liked_id, disliked_id, thread_id
+    cdef long long user_interaction_count, interaction_number
     cdef floating z, score, temp
 
     cdef floating * user
     cdef floating * liked
     cdef floating * disliked
 
-    cdef integral total_factors = X.shape[1]
-    cdef integral non_bias_factors = total_factors - <integral>item_biases
+    cdef int total_factors = X.shape[1]
+    cdef int non_bias_factors = total_factors - <int>item_biases
 
     with nogil, parallel(num_threads=num_threads):
 
