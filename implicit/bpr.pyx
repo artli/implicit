@@ -2,8 +2,6 @@ import cython
 from cython cimport floating
 import logging
 import multiprocessing
-import random
-import time
 from tqdm.auto import tqdm
 
 from cython.parallel import parallel, prange
@@ -55,9 +53,10 @@ cdef extern from "bpr.h" namespace "implicit" nogil:
 
 
 @cython.boundscheck(False)
-cdef long long lower_bound(integral[::1] sorted_list, integral value, int a = 1) nogil:
-    list_iter = algorithm.lower_bound(&sorted_list[0], &sorted_list[sorted_list.shape[0]], value)
-    index = list_iter - &sorted_list[0]
+cdef long long lower_bound(integral[::1] sorted_list, integral value) nogil:
+    cdef integral index = \
+        algorithm.lower_bound(&sorted_list[0], &sorted_list[sorted_list.shape[0]], value) \
+        - &sorted_list[0]
     if index >= sorted_list.shape[0]:
         index = -1
     return index
@@ -65,7 +64,7 @@ cdef long long lower_bound(integral[::1] sorted_list, integral value, int a = 1)
 
 @cython.boundscheck(False)
 cdef int find_row_number(integral[::1] indptr, integral cell_index) nogil:
-    row_number = lower_bound(indptr, cell_index)
+    cdef long long row_number = lower_bound(indptr, cell_index)
     if row_number >= indptr.shape[0] - 1:
         row_number = -1
     return row_number
@@ -74,7 +73,7 @@ cdef int find_row_number(integral[::1] indptr, integral cell_index) nogil:
 @cython.boundscheck(False)
 cdef long long find_entry_index(integral[::1] indices, integral[::1] indptr,
                                 integral row, integral col) nogil:
-    index_in_row = lower_bound(indices[indptr[row] : indptr[row + 1]], col)
+    cdef long long index_in_row = lower_bound(indices[indptr[row] : indptr[row + 1]], col)
     if index_in_row == -1:
         return -1
     return indptr[row] + index_in_row
@@ -85,7 +84,7 @@ cdef bool is_liked(integral[::1] indices, integral[::1] indptr, numeric[:] ratin
                    integral row, integral col) nogil:
     """ Given a CSR matrix, returns whether the [rowid, colid] contains a non zero.
     Assumes the CSR matrix has sorted indices """
-    index = find_entry_index(indices, indptr, row, col)
+    cdef long long index = find_entry_index(indices, indptr, row, col)
     return index == -1 or ratings[index] == 1
 
 
@@ -291,8 +290,10 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         return result
 
 
+@cython.cdivision(True)
+@cython.boundscheck(False)
 cdef floating _predict_score(floating[:, :] X, floating[:, :] Y,
-                             integral user_index, integral item_index, floating mean_rating):
+                             integral user_index, integral item_index, floating mean_rating) nogil:
     if user_index == -1 or item_index == -1:
         return mean_rating
     cdef floating * user = &X[user_index, 0]
@@ -333,7 +334,7 @@ def index_pairs_predict(integral[:, :] index_pairs,
 @cython.cdivision(True)
 @cython.boundscheck(False)
 def bpr_update(RNGVector rng,
-               numeric[:] ratings, integral[:] itemids, integral[:] indptr,
+               numeric[:] ratings, integral[::1] itemids, integral[::1] indptr,
                floating[:, :] X, floating[:, :] Y,
                float learning_rate, float reg,
                bool implicit, bool weighted_negatives, bool item_biases,
@@ -341,6 +342,8 @@ def bpr_update(RNGVector rng,
     cdef integral users = X.shape[0], items = Y.shape[0]
     cdef long samples = len(itemids), i, liked_index, disliked_index, correct = 0, skipped = 0
     cdef integral j, liked_id, disliked_id, thread_id
+    cdef long long user_id
+    cdef integral user_interaction_count, interaction_number
     cdef floating z, score, temp
 
     cdef floating * user
@@ -354,8 +357,8 @@ def bpr_update(RNGVector rng,
 
         thread_id = get_thread_num()
         for i in prange(samples, schedule='guided'):
-            liked_index = None
-            while liked_index is None or ratings[liked_index] == 0:
+            liked_index = -1
+            while liked_index == -1 or ratings[liked_index] == 0:
                 liked_index = rng.generate(thread_id)
             liked_id = itemids[liked_index]
 
