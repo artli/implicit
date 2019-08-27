@@ -255,8 +255,12 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
                                               num_threads, self.verify_negative_samples)
                 progress.update(1)
                 total = len(user_items.data)
-                progress.set_postfix({"correct": "%.2f%%" % (100.0 * correct / (total - skipped)),
-                                      "skipped": "%.2f%%" % (100.0 * skipped / total)})
+                def to_percents(value, total):
+                    if total == 0:
+                        return 0
+                    return 100.0 * value / total
+                progress.set_postfix({"correct": "%.2f%%" % to_percents(correct, total - skipped),
+                                      "skipped": "%.2f%%" % to_percents(skipped, total)})
 
     def _fit_gpu(self, user_items, userids_host, show_progress=True):
         if not implicit.cuda.HAS_CUDA:
