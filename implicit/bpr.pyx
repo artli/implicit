@@ -168,6 +168,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
                 " Increasing the number of non-bias factors from %i to %i.",
                 self.non_bias_factors, self.non_bias_factors + padding)
             self.non_bias_factors += padding
+        self.mean_rating = None
 
     @cython.cdivision(True)
     @cython.boundscheck(False)
@@ -190,9 +191,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         if not user_items.has_sorted_indices:
             user_items.sort_indices()
 
-        # for now, all we handle is float 32 values
-        if user_items.dtype != np.float32:
-            user_items = user_items.astype(np.float32)
+        self.mean_rating = user_items.data.mean()
 
         users, items = user_items.shape
 
@@ -276,6 +275,59 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
 
         X.to_host(self.user_factors)
         Y.to_host(self.item_factors)
+
+    def predict(self, user_items):
+        if hasattr(user_items, 'indices') and hasattr(user_items, 'indptr'):
+            result = np.zeros(len(user_items.indices), dtype=np.float32)
+            csr_predict(
+                user_items.indices, user_items.indptr,
+                self.user_factors, self.item_factors,
+                self.mean_rating, result, self.num_threads)
+        else:
+            result = np.zeros(user_items.shape[0], dtype=np.float32)
+            index_pairs_predict(
+                user_items, self.user_factors, self.item_factors,
+                self.mean_rating, result, self.num_threads)
+        return result
+
+
+cdef floating _predict_score(floating[:, :] X, floating[:, :] Y,
+                             integral user_index, integral item_index, floating mean_rating):
+    if user_index == -1 or item_index == -1:
+        return mean_rating
+    cdef floating * user = &X[user_index, 0]
+    cdef floating * item = &Y[item_index, 0]
+    cdef floating score = 0
+    cdef int factor
+    for factor in range(X.shape[1]):
+        score += user[factor] * item[factor]
+    return score
+
+
+@cython.cdivision(True)
+@cython.boundscheck(False)
+def csr_predict(integral[:] itemids, integral[:] indptr,
+                floating[:, :] X, floating[:, :] Y,
+                floating mean_rating, floating[:] out, int num_threads):
+    cdef integral interaction_index, user_index, item_index
+    with nogil, parallel(num_threads=num_threads):
+        for user_index in prange(len(indptr) - 1, schedule='guided'):
+            for interaction_index in range(indptr[user_index], indptr[user_index + 1]):
+                item_index = itemids[interaction_index]
+                out[interaction_index] = _predict_score(X, Y, user_index, item_index, mean_rating)
+
+
+@cython.cdivision(True)
+@cython.boundscheck(False)
+def index_pairs_predict(integral[:, :] index_pairs,
+                        floating[:, :] X, floating[:, :] Y,
+                        floating mean_rating, floating[:] out, int num_threads):
+    cdef integral interaction_index, user_index, item_index
+    with nogil, parallel(num_threads=num_threads):
+        for interaction_index in prange(index_pairs.shape[0], schedule='guided'):
+            user_index = index_pairs[interaction_index, 0]
+            item_index = index_pairs[interaction_index, 1]
+            out[interaction_index] = _predict_score(X, Y, user_index, item_index, mean_rating)
 
 
 @cython.cdivision(True)
