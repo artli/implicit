@@ -45,6 +45,14 @@ cdef long long lower_bound(numeric[::1] sorted_list, numeric value) nogil:
 
 
 @cython.boundscheck(False)
+cdef long long find_index(numeric[::1] sorted_list, numeric value) nogil:
+    cdef long long index = lower_bound(sorted_list, value)
+    if index != -1 and sorted_list[index] != value:
+        index = -1
+    return index
+
+
+@cython.boundscheck(False)
 cdef int find_row_number(integral_1[::1] indptr, integral_2 cell_index) nogil:
     cdef long long row_number = lower_bound(indptr, cell_index)
     if row_number >= indptr.shape[0] - 1:
@@ -55,7 +63,7 @@ cdef int find_row_number(integral_1[::1] indptr, integral_2 cell_index) nogil:
 @cython.boundscheck(False)
 cdef long long find_entry_index(integral_1[::1] indices, integral_2[::1] indptr,
                                 integral_3 row, integral_3 col) nogil:
-    cdef long long index_in_row = lower_bound(indices[indptr[row] : indptr[row + 1]], col)
+    cdef long long index_in_row = find_index(indices[indptr[row] : indptr[row + 1]], col)
     if index_in_row == -1:
         return -1
     return indptr[row] + index_in_row
@@ -67,7 +75,7 @@ cdef bool is_liked(integral_1[::1] indices, integral_2[::1] indptr, numeric[:] r
     """ Given a CSR matrix, returns whether the [rowid, colid] contains a non zero.
     Assumes the CSR matrix has sorted indices """
     cdef long long index = find_entry_index(indices, indptr, row, col)
-    return index == -1 or ratings[index] == 1
+    return index != -1 and ratings[index] == 1
 
 
 cdef class RNGVector(object):
@@ -284,8 +292,8 @@ def bpr_update(RNGVector rng,
     cdef int non_bias_factors = total_factors - <int>item_biases
 
     with nogil, parallel(num_threads=num_threads):
-
         thread_id = get_thread_num()
+
         for i in prange(samples, schedule='guided'):
             liked_index = -1
             while liked_index == -1 or ratings[liked_index] == 0:
@@ -294,7 +302,6 @@ def bpr_update(RNGVector rng,
 
             user_id = lower_bound(indptr, liked_index)
 
-            # if the user has liked the item, skip this for now
             if implicit:
                 if weighted_negatives:
                     disliked_index = rng.generate(thread_id)
@@ -307,6 +314,7 @@ def bpr_update(RNGVector rng,
                 disliked_index = indptr[user_id] + interaction_number
                 disliked_id = itemids[disliked_index]
 
+            # if the user has liked the item, skip this for now
             if verify_neg and is_liked(itemids, indptr, ratings, user_id, disliked_id):
                 skipped += 1
                 continue
