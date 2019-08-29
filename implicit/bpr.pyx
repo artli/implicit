@@ -35,9 +35,9 @@ cdef extern from "bpr.h" namespace "implicit" nogil:
 
 
 @cython.boundscheck(False)
-cdef long long lower_bound(numeric[::1] sorted_list, numeric value) nogil:
+cdef long long upper_bound(numeric[::1] sorted_list, numeric value) nogil:
     cdef ptrdiff_t index = \
-        algorithm.lower_bound(&sorted_list[0], &sorted_list[sorted_list.shape[0]], value) \
+        algorithm.upper_bound(&sorted_list[0], &sorted_list[sorted_list.shape[0]], value) \
         - &sorted_list[0]
     if index >= sorted_list.shape[0]:
         index = -1
@@ -46,16 +46,16 @@ cdef long long lower_bound(numeric[::1] sorted_list, numeric value) nogil:
 
 @cython.boundscheck(False)
 cdef long long find_index(numeric[::1] sorted_list, numeric value) nogil:
-    cdef long long index = lower_bound(sorted_list, value)
-    if index != -1 and sorted_list[index] != value:
+    cdef long long index = upper_bound(sorted_list, value) - 1
+    if index < 0 or sorted_list[index] != value:
         index = -1
     return index
 
 
 @cython.boundscheck(False)
 cdef int find_row_number(integral_1[::1] indptr, integral_2 cell_index) nogil:
-    cdef long long row_number = lower_bound(indptr, cell_index)
-    if row_number >= indptr.shape[0] - 1:
+    cdef long long row_number = upper_bound(indptr, cell_index) - 1
+    if row_number < 0:
         row_number = -1
     return row_number
 
@@ -280,7 +280,8 @@ def bpr_update(RNGVector rng,
                int num_threads, bool verify_neg):
     cdef int users = X.shape[0], items = Y.shape[0]
     cdef long long samples = len(itemids), i, liked_index, disliked_index, correct = 0, skipped = 0
-    cdef int j, user_id, liked_id, disliked_id, thread_id
+    cdef int j, user_id = -1, liked_id = -1, disliked_id = -1, thread_id
+    cdef bool unknown, wrong_sample
     cdef long long user_interaction_count, interaction_number
     cdef floating z, score, temp
 
@@ -300,7 +301,7 @@ def bpr_update(RNGVector rng,
                 liked_index = rng.generate(thread_id)
             liked_id = itemids[liked_index]
 
-            user_id = lower_bound(indptr, liked_index)
+            user_id = find_row_number(indptr, liked_index)
 
             if implicit:
                 if weighted_negatives:
@@ -308,14 +309,16 @@ def bpr_update(RNGVector rng,
                     disliked_id = itemids[disliked_index]
                 else:
                     disliked_id = rng.generate(thread_id) % items
-            else:
+            elif user_id != -1:
                 user_interaction_count = indptr[user_id + 1] - indptr[user_id]
                 interaction_number = rng.generate(thread_id) % user_interaction_count
                 disliked_index = indptr[user_id] + interaction_number
                 disliked_id = itemids[disliked_index]
 
+            unknown = user_id == -1 or liked_id == -1 or disliked_id == -1
             # if the user has liked the item, skip this for now
-            if verify_neg and is_liked(itemids, indptr, ratings, user_id, disliked_id):
+            wrong_sample = verify_neg and is_liked(itemids, indptr, ratings, user_id, disliked_id)
+            if unknown or wrong_sample:
                 skipped += 1
                 continue
 
