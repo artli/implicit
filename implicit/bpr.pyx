@@ -131,7 +131,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         Array of latent factors for each user in the training set
     """
     def __init__(self, factors=100, learning_rate=0.01, regularization=0.01, dtype=np.float32,
-                 iterations=100, implicit=True, weighted_negatives=True, item_biases=True,
+                 iterations=100, implicit_prob=1.0, weighted_negatives=True, item_biases=True,
                  use_gpu=implicit.cuda.HAS_CUDA, num_threads=0,
                  verify_negative_samples=True):
         super(BayesianPersonalizedRanking, self).__init__()
@@ -143,7 +143,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         self.iterations = iterations
         self.regularization = regularization
         self.dtype = dtype
-        self.implicit = implicit
+        self.implicit_prob = implicit_prob
         self.weighted_negatives = weighted_negatives
         self.item_biases = item_biases
         self.use_gpu = use_gpu
@@ -225,7 +225,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
                 correct, skipped = bpr_update(rng, user_items.data, user_items.indices, user_items.indptr,
                                               self.user_factors, self.item_factors,
                                               self.learning_rate, self.regularization,
-                                              self.implicit, self.weighted_negatives, self.item_biases,
+                                              self.implicit_prob, self.weighted_negatives, self.item_biases,
                                               num_threads, self.verify_negative_samples)
                 progress.update(1)
                 total = len(user_items.data)
@@ -276,7 +276,7 @@ def bpr_update(RNGVector rng,
                numeric[:] ratings, integral_1[::1] itemids, integral_2[::1] indptr,
                floating[:, :] X, floating[:, :] Y,
                float learning_rate, float reg,
-               bool implicit, bool weighted_negatives, bool item_biases,
+               float implicit_prob, bool weighted_negatives, bool item_biases,
                int num_threads, bool verify_neg):
     cdef int users = X.shape[0], items = Y.shape[0]
     cdef long long samples = len(itemids), i, liked_index, disliked_index, correct = 0, skipped = 0
@@ -303,7 +303,8 @@ def bpr_update(RNGVector rng,
 
             user_id = find_row_number(indptr, liked_index)
 
-            if implicit:
+            temp = rng.generate(thread_id) / <float>ratings.shape[0]
+            if temp < implicit_prob:
                 if weighted_negatives:
                     disliked_index = rng.generate(thread_id)
                     disliked_id = itemids[disliked_index]
