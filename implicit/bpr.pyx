@@ -159,6 +159,60 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
             self.non_bias_factors += padding
         self.mean_rating = None
 
+    def _random_factor_matrix(self, row_count):
+        result = np.random.rand(row_count, self.total_factors).astype(self.dtype) - .5
+        result /= self.non_bias_factors
+        return result
+
+    def _exact_num_threads(self):
+        # we accept num_threads = 0 as indicating to create as many threads as we have cores,
+        # but in that case we need the number of cores, since we need to initialize RNG state per
+        # thread. Get the appropiate value back from openmp
+        if self.num_threads == 0:
+            return multiprocessing.cpu_count()
+        return self.num_threads
+
+    def _train(
+            self, user_items, learning_rate, regularization, implicit_prob, one_step_per_user,
+            user_factors, item_factors, update_items, iterations, show_progress=True):
+        cdef int num_threads = self._exact_num_threads()
+        cdef RNGVector rng = RNGVector(num_threads, len(user_items.data) - 1)
+        cdef int steps_per_iteration = user_items.shape[0] if one_step_per_user else len(user_items.data)
+        with tqdm(total=iterations, disable=not show_progress) as progress:
+            for epoch in range(iterations):
+                correct, skipped = bpr_epoch(
+                    rng, user_items.data, user_items.indices, user_items.indptr,
+                    user_factors, item_factors,
+                    learning_rate, regularization,
+                    implicit_prob, one_step_per_user, self.weighted_negatives,
+                    self.item_biases, update_items,
+                    num_threads, self.verify_negative_samples)
+                progress.update(1)
+                def to_percents(value, total):
+                    if total == 0:
+                        return 0
+                    return 100.0 * value / total
+                progress.set_postfix({
+                    "correct": "%.2f%%" % to_percents(correct, steps_per_iteration - skipped),
+                    "skipped": "%.2f%%" % to_percents(skipped, steps_per_iteration)})
+
+    def compute_user_profiles(
+            self, user_items, iterations, learning_rate=None, regularization=None,
+            implicit_prob=None, initial_profiles=None, show_progress=True):
+        profiles = initial_profiles
+        if profiles is None:
+            profiles = self._random_factor_matrix(row_count=user_items.shape[0])
+        if learning_rate is None:
+            learning_rate = self.learning_rate
+        if regularization is None:
+            regularization = self.regularization
+        if implicit_prob is None:
+            implicit_prob = self.implicit_prob
+        self._train(
+            user_items, learning_rate, regularization, implicit_prob, True,
+            profiles, self.item_factors, False, iterations, show_progress)
+        return profiles
+
     @cython.cdivision(True)
     @cython.boundscheck(False)
     def fit(self, item_users=None, user_items=None, show_progress=True):
@@ -188,17 +242,13 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         # Note: the final dimension is for the item bias term - which is set to a 1 for all users
         # this simplifies interfacing with approximate nearest neighbours libraries etc
         if self.item_factors is None:
-            self.item_factors = (np.random.rand(items, self.total_factors).astype(self.dtype) - .5)
-            self.item_factors /= self.non_bias_factors
-
+            self.item_factors = self._random_factor_matrix(items)
             # set factors to all zeros for items without any ratings
             item_counts = np.bincount(user_items.indices, minlength=items)
             self.item_factors[item_counts == 0] = np.zeros(self.total_factors)
 
         if self.user_factors is None:
-            self.user_factors = (np.random.rand(users, self.total_factors).astype(self.dtype) - .5)
-            self.user_factors /= self.non_bias_factors
-
+            self.user_factors = self._random_factor_matrix(users)
             # set factors to all zeros for users without any ratings
             user_counts = np.ediff1d(user_items.indptr)
             self.user_factors[user_counts == 0] = np.zeros(self.total_factors)
@@ -210,31 +260,9 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
             raise NotImplementedError
             # return self._fit_gpu(user_items, userids, show_progress)
 
-        # we accept num_threads = 0 as indicating to create as many threads as we have cores,
-        # but in that case we need the number of cores, since we need to initialize RNG state per
-        # thread. Get the appropiate value back from openmp
-        cdef int num_threads = self.num_threads
-        if not num_threads:
-            num_threads = multiprocessing.cpu_count()
-
-        # initialize RNG's, one per thread.
-        cdef RNGVector rng = RNGVector(num_threads, len(user_items.data) - 1)
-        log.debug("Running %i BPR training epochs", self.iterations)
-        with tqdm(total=self.iterations, disable=not show_progress) as progress:
-            for epoch in range(self.iterations):
-                correct, skipped = bpr_update(rng, user_items.data, user_items.indices, user_items.indptr,
-                                              self.user_factors, self.item_factors,
-                                              self.learning_rate, self.regularization,
-                                              self.implicit_prob, self.weighted_negatives, self.item_biases,
-                                              num_threads, self.verify_negative_samples)
-                progress.update(1)
-                total = len(user_items.data)
-                def to_percents(value, total):
-                    if total == 0:
-                        return 0
-                    return 100.0 * value / total
-                progress.set_postfix({"correct": "%.2f%%" % to_percents(correct, total - skipped),
-                                      "skipped": "%.2f%%" % to_percents(skipped, total)})
+        self._train(
+            user_items, self.learning_rate, self.regularization, self.implicit_prob, False,
+            self.user_factors, self.item_factors, True, self.iterations, show_progress)
 
     def _fit_gpu(self, user_items, userids_host, show_progress=True):
         if not implicit.cuda.HAS_CUDA:
@@ -271,37 +299,111 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
 
 
 @cython.cdivision(True)
-@cython.boundscheck(False)
-def bpr_update(RNGVector rng,
-               numeric[:] ratings, integral_1[::1] itemids, integral_2[::1] indptr,
-               floating[:, :] X, floating[:, :] Y,
-               float learning_rate, float reg,
-               float implicit_prob, bool weighted_negatives, bool item_biases,
-               int num_threads, bool verify_neg):
-    cdef int users = X.shape[0], items = Y.shape[0]
-    cdef long long samples = len(itemids), i, liked_index, disliked_index, correct = 0, skipped = 0
-    cdef int j, user_id = -1, liked_id = -1, disliked_id = -1, thread_id
-    cdef bool unknown, wrong_sample
-    cdef long long user_interaction_count, interaction_number
+@cython.boundscheck(True)
+cdef bool bpr_update_profiles(
+        floating *user, floating *liked, floating *disliked, int total_factors,
+        float learning_rate, float reg, bool item_biases, bool update_items) nogil:
+    cdef int non_bias_factors = total_factors - <int>item_biases
+    cdef int j
     cdef floating z, score, temp
+
+    # compute the score
+    score = 0
+    for j in range(total_factors):
+        score = score + user[j] * (liked[j] - disliked[j])
+    z = 1.0 / (1.0 + exp(score))
+
+    # update the factors via sgd.
+    for j in range(non_bias_factors):
+        temp = user[j]
+        user[j] += learning_rate * (z * (liked[j] - disliked[j]) - reg * user[j])
+        if update_items:
+            liked[j] += learning_rate * (z * temp - reg * liked[j])
+            disliked[j] += learning_rate * (-z * temp - reg * disliked[j])
+
+    if item_biases and update_items:
+        # update item bias terms (last column of factorized matrix)
+        liked[non_bias_factors] += learning_rate * (z - reg * liked[non_bias_factors])
+        disliked[non_bias_factors] += learning_rate * (-z - reg * disliked[non_bias_factors])
+
+    return z < .5
+
+
+@cython.cdivision(True)
+@cython.boundscheck(False)
+cdef long long sample_user_interaction_index(
+        RNGVector rng, int thread_id, integral_1[::1] itemids, integral_2[::1] indptr, int user_id) nogil:
+    cdef long long user_interaction_count, interaction_number
+    if user_id == -1:
+        return -1
+    user_interaction_count = indptr[user_id + 1] - indptr[user_id]
+    if user_interaction_count == -1:
+        return -1
+    interaction_number = rng.generate(thread_id) % user_interaction_count
+    return indptr[user_id] + interaction_number
+
+
+@cython.cdivision(True)
+@cython.boundscheck(True)
+def bpr_epoch(
+        RNGVector rng,
+        numeric[:] ratings, integral_1[::1] itemids, integral_2[::1] indptr,
+        floating[:, :] X, floating[:, :] Y,
+        float learning_rate, float reg,
+        float implicit_prob, bool one_step_per_user, bool weighted_negatives,
+        bool item_biases, bool update_items,
+        int num_threads, bool verify_neg):
+    if one_step_per_user and update_items:
+        raise NotImplementedError(
+            'Proper user shuffling is not implemented in the per-user sampling scheme')
+
+    cdef int users = X.shape[0]
+    cdef int items = Y.shape[0]
+    cdef int total_factors = Y.shape[1]
+    cdef long long sample_count, i, liked_index, disliked_index
+    cdef long long correct = 0
+    cdef long long skipped1 = 0
+    cdef long long skipped2 = 0
+    cdef int user_id = -1
+    cdef int liked_id = -1
+    cdef int disliked_id = -1
+    cdef int thread_id
+    cdef int j
+    cdef bool unknown, wrong_sample
+    cdef float temp
 
     cdef floating * user
     cdef floating * liked
     cdef floating * disliked
 
-    cdef int total_factors = X.shape[1]
-    cdef int non_bias_factors = total_factors - <int>item_biases
+    if one_step_per_user:
+        sample_count = users
+    else:
+        sample_count = len(ratings)
 
     with nogil, parallel(num_threads=num_threads):
         thread_id = get_thread_num()
 
-        for i in prange(samples, schedule='guided'):
-            liked_index = -1
-            while liked_index == -1 or ratings[liked_index] == 0:
-                liked_index = rng.generate(thread_id)
-            liked_id = itemids[liked_index]
+        for i in prange(sample_count, schedule='guided'):
+            if one_step_per_user:
+                user_id = i
+                if indptr[user_id + 1] - indptr[user_id] == 0:
+                    continue
 
-            user_id = find_row_number(indptr, liked_index)
+            for j in range(20):
+                if one_step_per_user:
+                    liked_index = sample_user_interaction_index(rng, thread_id, itemids, indptr, user_id)
+                else:
+                    liked_index = rng.generate(thread_id)
+                if liked_index != -1 and ratings[liked_index] == 1:
+                    break
+            else:
+                skipped1 += 1
+                continue
+
+            liked_id = itemids[liked_index]
+            if not one_step_per_user:
+                user_id = find_row_number(indptr, liked_index)
 
             temp = rng.generate(thread_id) / <float>ratings.shape[0]
             if temp < implicit_prob:
@@ -310,41 +412,23 @@ def bpr_update(RNGVector rng,
                     disliked_id = itemids[disliked_index]
                 else:
                     disliked_id = rng.generate(thread_id) % items
-            elif user_id != -1:
-                user_interaction_count = indptr[user_id + 1] - indptr[user_id]
-                interaction_number = rng.generate(thread_id) % user_interaction_count
-                disliked_index = indptr[user_id] + interaction_number
+            else:
+                disliked_index = sample_user_interaction_index(rng, thread_id, itemids, indptr, user_id)
                 disliked_id = itemids[disliked_index]
 
             unknown = user_id == -1 or liked_id == -1 or disliked_id == -1
             # if the user has liked the item, skip this for now
             wrong_sample = verify_neg and is_liked(itemids, indptr, ratings, user_id, disliked_id)
             if unknown or wrong_sample:
-                skipped += 1
+                skipped2 += 1
                 continue
 
             # get pointers to the relevant factors
             user, liked, disliked = &X[user_id, 0], &Y[liked_id, 0], &Y[disliked_id, 0]
 
-            # compute the score
-            score = 0
-            for j in range(total_factors):
-                score = score + user[j] * (liked[j] - disliked[j])
-            z = 1.0 / (1.0 + exp(score))
-
-            if z < .5:
+            if bpr_update_profiles(
+                    user, liked, disliked, total_factors,
+                    learning_rate, reg, item_biases, update_items):
                 correct += 1
 
-            # update the factors via sgd.
-            for j in range(non_bias_factors):
-                temp = user[j]
-                user[j] += learning_rate * (z * (liked[j] - disliked[j]) - reg * user[j])
-                liked[j] += learning_rate * (z * temp - reg * liked[j])
-                disliked[j] += learning_rate * (-z * temp - reg * disliked[j])
-
-            if item_biases:
-                # update item bias terms (last column of factorized matrix)
-                liked[non_bias_factors] += learning_rate * (z - reg * liked[non_bias_factors])
-                disliked[non_bias_factors] += learning_rate * (-z - reg * disliked[non_bias_factors])
-
-    return correct, skipped
+    return correct, skipped1 + skipped2
