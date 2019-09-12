@@ -10,10 +10,11 @@ import cython
 import multiprocessing
 import numpy as np
 from cython.parallel import parallel, prange
+from libcpp cimport bool
 from scipy.sparse import csr_matrix
 from tqdm.auto import tqdm
 
-from .types cimport floating, integral_1, integral_2
+from .types cimport floating, integral_1, integral_2, integral_3
 
 
 # Define wrapper for C++ sorting function
@@ -351,14 +352,17 @@ class MatrixFactorizationBase(RecommenderBase):
             self._item_norms[self._item_norms == 0] = 1e-10
         return self._item_norms
 
-    def predict(self, user_items):
+    def predict(self, user_items, user_indices=None):
         if hasattr(user_items, 'indices') and hasattr(user_items, 'indptr'):
             result = np.zeros(len(user_items.indices), dtype=np.float32)
             csr_predict(
                 user_items.indices, user_items.indptr,
+                user_indices if user_indices is not None else np.zeros((0,), np.int32),
+                user_indices is not None,
                 self.user_factors, self.item_factors,
                 self.mean_rating, result, self.num_threads)
         else:
+            assert user_indices is None
             result = np.zeros(user_items.shape[0], dtype=np.float32)
             index_pairs_predict(
                 user_items, self.user_factors, self.item_factors,
@@ -384,15 +388,20 @@ cdef floating _predict_score(floating[:, :] X, floating[:, :] Y,
 @cython.cdivision(True)
 @cython.boundscheck(False)
 def csr_predict(integral_1[:] itemids, integral_2[:] indptr,
+                integral_3[:] user_indices, bool transform_user_indices,
                 floating[:, :] X, floating[:, :] Y,
                 floating mean_rating, floating[:] out, int num_threads):
-    cdef integral_1 user_index, item_index
+    cdef integral_1 item_index, user_index, transformed_user_index
     cdef integral_2 interaction_index
     with nogil, parallel(num_threads=num_threads):
         for user_index in prange(len(indptr) - 1, schedule='guided'):
+            if transform_user_indices:
+                transformed_user_index = user_indices[user_index]
+            else:
+                transformed_user_index = user_index
             for interaction_index in range(indptr[user_index], indptr[user_index + 1]):
                 item_index = itemids[interaction_index]
-                out[interaction_index] = _predict_score(X, Y, user_index, item_index, mean_rating)
+                out[interaction_index] = _predict_score(X, Y, transformed_user_index, item_index, mean_rating)
 
 
 @cython.cdivision(True)
