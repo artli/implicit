@@ -164,6 +164,15 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         result /= self.non_bias_factors
         return result
 
+    def random_item_matrix(self, row_count):
+        return self._random_factor_matrix(row_count)
+
+    def random_user_matrix(self, row_count):
+        result = self._random_factor_matrix(row_count)
+        if self.item_biases:
+            result[:, -1] = 1
+        return result
+
     def _exact_num_threads(self):
         # we accept num_threads = 0 as indicating to create as many threads as we have cores,
         # but in that case we need the number of cores, since we need to initialize RNG state per
@@ -242,19 +251,16 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         # Note: the final dimension is for the item bias term - which is set to a 1 for all users
         # this simplifies interfacing with approximate nearest neighbours libraries etc
         if self.item_factors is None:
-            self.item_factors = self._random_factor_matrix(items)
+            self.item_factors = self.random_item_matrix(items)
             # set factors to all zeros for items without any ratings
             item_counts = np.bincount(user_items.indices, minlength=items)
             self.item_factors[item_counts == 0] = np.zeros(self.total_factors)
 
         if self.user_factors is None:
-            self.user_factors = self._random_factor_matrix(users)
+            self.user_factors = self.random_user_matrix(users)
             # set factors to all zeros for users without any ratings
             user_counts = np.ediff1d(user_items.indptr)
-            self.user_factors[user_counts == 0] = np.zeros(self.total_factors)
-
-            if self.item_biases:
-                self.user_factors[:, self.non_bias_factors] = 1.0
+            self.user_factors[user_counts == 0] = 0
 
         if self.use_gpu:
             raise NotImplementedError
